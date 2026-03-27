@@ -17,6 +17,12 @@ static volatile bool g_running = true;
 
 void signal_handler(int) { g_running = false; }
 
+// Safe write that handles SIGPIPE / broken pipe gracefully
+static bool safe_write(int fd, const void * data, size_t len) {
+    ssize_t n = write(fd, data, len);
+    return n >= 0 && (size_t)n == len;
+}
+
 // Simple JSON value extractor (no dependency needed)
 static std::string json_get_string(const std::string & json, const std::string & key) {
     std::string search = "\"" + key + "\"";
@@ -152,18 +158,20 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
                     buf[i] = (int16_t)(s * 32767.0f);
                 }
 
-                // HTTP chunked encoding
+                // HTTP chunked encoding — handle broken pipe gracefully
                 char chunk_hdr[32];
                 int chunk_len = n_samples * 2;
                 int hdr_len = snprintf(chunk_hdr, sizeof(chunk_hdr), "%x\r\n", chunk_len);
-                write(client_fd, chunk_hdr, hdr_len);
-                write(client_fd, buf.data(), chunk_len);
-                write(client_fd, "\r\n", 2);
+                if (!safe_write(client_fd, chunk_hdr, hdr_len) ||
+                    !safe_write(client_fd, buf.data(), chunk_len) ||
+                    !safe_write(client_fd, "\r\n", 2)) {
+                    return;  // client disconnected, stop streaming
+                }
 
                 total_samples += n_samples;
 
                 if (is_final) {
-                    write(client_fd, "0\r\n\r\n", 5);  // chunked terminator
+                    safe_write(client_fd, "0\r\n\r\n", 5);
                 }
             },
             4,    // chunk_frames
@@ -433,6 +441,7 @@ int main(int argc, char ** argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);  // ignore broken pipe — safe_write handles it
 
     fprintf(stderr, "Listening on http://127.0.0.1:%d\n", port);
     fprintf(stderr, "  POST /api/tts  {\"text\":\"...\",\"language\":\"de\",\"voice\":\"lina\"}\n");
