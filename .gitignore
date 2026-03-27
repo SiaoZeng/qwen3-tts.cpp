@@ -48,3 +48,9 @@ Thumbs.db
 debug_*.bin
 reference/decoder_debug/
 reference/debug/
+build*/
+build-dbg/
+models/
+.venv/
+voices/*.wav
+
