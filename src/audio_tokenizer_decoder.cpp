@@ -315,30 +315,63 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
+    // Load all decoder tensors on GPU (Vulkan/iGPU)
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_,
                                      GGML_BACKEND_DEVICE_TYPE_IGPU)) {
         return false;
     }
-    
+
     for (int i = 0; i < 4; ++i) {
         model_.dec_blocks[i].res[0].dilation = 1;
         model_.dec_blocks[i].res[1].dilation = 3;
         model_.dec_blocks[i].res[2].dilation = 9;
     }
-    
-    normalize_codebooks();
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
+
+    // Normalize codebooks: copy to host, normalize, upload back to GPU
+    // Cannot modify Vulkan-mapped tensor->data directly
+    {
+        auto normalize_and_upload = [](struct ggml_tensor * codebook, struct ggml_tensor * usage) {
+            if (!codebook || !usage) return;
+            size_t cb_bytes = ggml_nbytes(codebook);
+            size_t usage_bytes = ggml_nbytes(usage);
+
+            // Allocate host buffers
+            std::vector<uint8_t> cb_host(cb_bytes);
+            std::vector<uint8_t> usage_host(usage_bytes);
+
+            // Download from GPU to host
+            ggml_backend_tensor_get(codebook, cb_host.data(), 0, cb_bytes);
+            ggml_backend_tensor_get(usage, usage_host.data(), 0, usage_bytes);
+
+            // Normalize on host
+            ggml_fp16_t * cb_data = (ggml_fp16_t *)cb_host.data();
+            float * usage_data = (float *)usage_host.data();
+            int64_t codebook_dim = codebook->ne[0];
+            int64_t codebook_size = codebook->ne[1];
+            const float epsilon = 1e-5f;
+
+            for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
+                float u = usage_data[emb_idx];
+                if (u < epsilon) u = epsilon;
+                float inv_u = 1.0f / u;
+                for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
+                    int64_t idx = dim_idx + emb_idx * codebook_dim;
+                    float val = ggml_fp16_to_fp32(cb_data[idx]);
+                    cb_data[idx] = ggml_fp32_to_fp16(val * inv_u);
+                }
+            }
+
+            // Upload normalized data back to GPU
+            ggml_backend_tensor_set(codebook, cb_host.data(), 0, cb_bytes);
+        };
+
+        normalize_and_upload(model_.vq_first_codebook, model_.vq_first_usage);
+        for (int i = 0; i < 15; ++i) {
+            normalize_and_upload(model_.vq_rest_codebook[i], model_.vq_rest_usage[i]);
         }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
     }
-    
+
     state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
     if (!state_.backend) {
         return false;
