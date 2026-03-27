@@ -77,6 +77,107 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
         return;
     }
 
+    // GET /api/tts/stream?text=...&lang=de&voice=lina — returns raw WAV directly
+    if (request.find("GET /api/tts/stream") != std::string::npos) {
+        // Parse query params from URL
+        size_t q = request.find('?');
+        size_t end = request.find(" HTTP");
+        std::string query = (q != std::string::npos && end != std::string::npos) ?
+            request.substr(q + 1, end - q - 1) : "";
+
+        auto get_param = [&query](const std::string & key) -> std::string {
+            size_t pos = query.find(key + "=");
+            if (pos == std::string::npos) return "";
+            pos += key.size() + 1;
+            size_t amp = query.find('&', pos);
+            std::string val = (amp != std::string::npos) ? query.substr(pos, amp - pos) : query.substr(pos);
+            // URL decode spaces
+            for (size_t i = 0; i < val.size(); i++) {
+                if (val[i] == '+') val[i] = ' ';
+                if (val[i] == '%' && i + 2 < val.size()) {
+                    int c; sscanf(val.c_str() + i + 1, "%2x", &c);
+                    val = val.substr(0, i) + (char)c + val.substr(i + 3);
+                }
+            }
+            return val;
+        };
+
+        std::string text = get_param("text");
+        std::string lang = get_param("lang");
+        std::string voice = get_param("voice");
+        if (voice.empty()) voice = "lina";
+        if (lang.empty()) lang = "de";
+
+        if (text.empty()) {
+            send_response(client_fd, 400, "text/plain", "Missing text param");
+            close(client_fd);
+            return;
+        }
+
+        qwen3_tts::tts_params params = default_params;
+        if      (lang == "de") params.language_id = 2053;
+        else if (lang == "en") params.language_id = 2050;
+        else if (lang == "zh") params.language_id = 2055;
+        else if (lang == "ja") params.language_id = 2058;
+        else if (lang == "ko") params.language_id = 2064;
+
+        std::string emb_path = voices_dir + "/" + voice + ".bin";
+        qwen3_tts::tts_result result;
+        FILE * ef = fopen(emb_path.c_str(), "rb");
+        if (ef) {
+            int32_t es; fread(&es, 4, 1, ef);
+            std::vector<float> emb(es); fread(emb.data(), 4, es, ef); fclose(ef);
+            result = tts.synthesize_with_embedding(text, emb.data(), es, params);
+        } else {
+            result = tts.synthesize(text, params);
+        }
+
+        if (!result.success) {
+            send_response(client_fd, 500, "text/plain", result.error_msg);
+            close(client_fd);
+            return;
+        }
+
+        // Build WAV in memory
+        int32_t sr = result.sample_rate;
+        int32_t ns = result.audio.size();
+        int32_t ds = ns * 2;
+        int32_t fs = 36 + ds;
+        std::vector<uint8_t> wav(44 + ds);
+        uint8_t * p = wav.data();
+        memcpy(p, "RIFF", 4); p+=4; memcpy(p, &fs, 4); p+=4;
+        memcpy(p, "WAVE", 4); p+=4; memcpy(p, "fmt ", 4); p+=4;
+        int32_t fmts=16; memcpy(p,&fmts,4); p+=4;
+        int16_t tag=1; memcpy(p,&tag,2); p+=2;
+        int16_t ch=1; memcpy(p,&ch,2); p+=2;
+        memcpy(p,&sr,4); p+=4;
+        int32_t br=sr*2; memcpy(p,&br,4); p+=4;
+        int16_t ba=2; memcpy(p,&ba,2); p+=2;
+        int16_t bits=16; memcpy(p,&bits,2); p+=2;
+        memcpy(p, "data", 4); p+=4; memcpy(p,&ds,4); p+=4;
+        for (int32_t i = 0; i < ns; i++) {
+            float s = std::max(-1.0f, std::min(1.0f, result.audio[i]));
+            int16_t sample = (int16_t)(s * 32767.0f);
+            memcpy(p, &sample, 2); p += 2;
+        }
+
+        // Send WAV directly — client can pipe to pw-play
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: audio/wav\r\n"
+            << "Content-Length: " << wav.size() << "\r\n"
+            << "Connection: close\r\n\r\n";
+        std::string h = hdr.str();
+        write(client_fd, h.c_str(), h.size());
+        write(client_fd, wav.data(), wav.size());
+        close(client_fd);
+
+        float dur = (float)ns / sr;
+        fprintf(stderr, "[TTS/stream] \"%s\" %.1fs in %lldms\n",
+                text.c_str(), dur, (long long)result.t_total_ms);
+        return;
+    }
+
     // POST /api/tts
     if (request.find("POST /api/tts") == std::string::npos) {
         send_response(client_fd, 404, "text/plain", "Not Found");
