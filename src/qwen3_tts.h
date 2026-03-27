@@ -126,6 +126,16 @@ public:
                                           const float * embedding, int32_t embedding_size,
                                           const tts_params & params = tts_params());
 
+    // Streaming synthesis: emits PCM chunks as they are generated
+    // on_chunk(pcm_data, n_samples, is_final) — called for each audio chunk
+    using chunk_callback_t = std::function<void(const float *, int32_t, bool)>;
+    bool synthesize_streaming(const std::string & text,
+                              const float * embedding, int32_t embedding_size,
+                              const tts_params & params,
+                              chunk_callback_t on_chunk,
+                              int32_t chunk_frames = 4,
+                              int32_t overlap_samples = 512);
+
     // Set progress callback
     void set_progress_callback(tts_progress_callback_t callback);
     

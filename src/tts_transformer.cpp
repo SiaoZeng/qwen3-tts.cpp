@@ -2748,6 +2748,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             output.push_back(frame_codes[cb]);
         }
 
+        // Streaming callback (if set)
+        if (frame_callback_) {
+            if (!frame_callback_(frame_codes.data(), cfg.n_codebooks, frame)) {
+                break;  // callback requested stop
+            }
+        }
+
 #ifdef QWEN3_TTS_TIMING
         timing.n_frames = frame + 1;
 #endif
@@ -2848,6 +2855,19 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
 
     return true;
+}
+
+bool TTSTransformer::generate_streaming(const int32_t * text_tokens, int32_t n_tokens,
+                                         const float * speaker_embd, int32_t max_len,
+                                         frame_callback_t on_frame,
+                                         int32_t language_id, float repetition_penalty,
+                                         float temperature, int32_t top_k) {
+    frame_callback_ = std::move(on_frame);
+    std::vector<int32_t> output;
+    bool result = generate(text_tokens, n_tokens, speaker_embd, max_len, output,
+                           language_id, repetition_penalty, temperature, top_k);
+    frame_callback_ = nullptr;
+    return result;
 }
 
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,

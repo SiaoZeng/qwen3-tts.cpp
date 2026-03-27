@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <functional>
 #ifdef QWEN3_TTS_TIMING
 #include <chrono>
 #endif
@@ -265,6 +266,17 @@ public:
                   float repetition_penalty = 1.05f,
                   float temperature = 0.9f,
                   int32_t top_k = 50);
+
+    // Streaming variant: calls on_frame after each frame instead of collecting all codes
+    // on_frame(frame_codes, n_codebooks, frame_idx) — return false to stop generation
+    using frame_callback_t = std::function<bool(const int32_t *, int32_t, int32_t)>;
+    bool generate_streaming(const int32_t * text_tokens, int32_t n_tokens,
+                            const float * speaker_embd, int32_t max_len,
+                            frame_callback_t on_frame,
+                            int32_t language_id = 2050,
+                            float repetition_penalty = 1.05f,
+                            float temperature = 0.9f,
+                            int32_t top_k = 50);
     
     const tts_transformer_config & get_config() const { return model_.config; }
     
@@ -279,7 +291,12 @@ public:
                             int32_t audio_start_pos, int32_t n_past,
                             std::vector<float> & output);
     
+    // Set/clear the per-frame streaming callback
+    void set_frame_callback(frame_callback_t cb) { frame_callback_ = std::move(cb); }
+    void clear_frame_callback() { frame_callback_ = nullptr; }
+
 private:
+    frame_callback_t frame_callback_;
     bool try_init_coreml_code_predictor(const std::string & model_path);
     bool predict_codes_autoregressive_coreml(const float * hidden, int32_t codebook_0_token,
                                              std::vector<int32_t> & output,

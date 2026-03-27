@@ -511,6 +511,114 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     return result;
 }
 
+bool Qwen3TTS::synthesize_streaming(const std::string & text,
+                                     const float * embedding, int32_t embedding_size,
+                                     const tts_params & params,
+                                     chunk_callback_t on_chunk,
+                                     int32_t chunk_frames,
+                                     int32_t overlap_samples) {
+    // 1. Tokenize
+    std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
+    if (text_tokens.empty()) {
+        error_msg_ = "Failed to tokenize text";
+        return false;
+    }
+
+    // 2. Ensure decoder is loaded
+    if (!decoder_loaded_) {
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            error_msg_ = "Failed to load vocoder: " + audio_decoder_.get_error();
+            return false;
+        }
+        decoder_loaded_ = true;
+    }
+
+    // 3. Ensure transformer is loaded
+    if (!transformer_loaded_) {
+        if (!transformer_.load_model(tts_model_path_)) {
+            error_msg_ = "Failed to load transformer: " + transformer_.get_error();
+            return false;
+        }
+        transformer_loaded_ = true;
+    }
+    transformer_.clear_kv_cache();
+
+    const int32_t n_codebooks = transformer_.get_config().n_codebooks;
+
+    // 4. Streaming state
+    std::vector<int32_t> frame_buffer;
+    std::vector<float> prev_tail(overlap_samples, 0.0f);
+    bool first_chunk = true;
+    bool decode_error = false;
+
+    // 5. Generate with frame callback
+    transformer_.generate_streaming(text_tokens.data(), (int32_t)text_tokens.size(),
+        embedding, params.max_audio_tokens,
+        [&](const int32_t * frame_codes, int32_t n_cb, int32_t frame_idx) -> bool {
+            // Accumulate frame
+            for (int i = 0; i < n_cb; ++i)
+                frame_buffer.push_back(frame_codes[i]);
+
+            int32_t buffered_frames = (int32_t)frame_buffer.size() / n_codebooks;
+
+            // Emit when enough frames accumulated
+            if (buffered_frames >= chunk_frames) {
+                std::vector<float> pcm;
+                if (!audio_decoder_.decode(frame_buffer.data(), buffered_frames, pcm)) {
+                    decode_error = true;
+                    return false;
+                }
+
+                if (!first_chunk && overlap_samples > 0 && (int32_t)pcm.size() >= overlap_samples) {
+                    // Crossfade with previous tail
+                    for (int32_t i = 0; i < overlap_samples; ++i) {
+                        float w = 0.5f * (1.0f - cosf(3.14159265f * (float)i / (float)overlap_samples));
+                        pcm[i] = prev_tail[i] * (1.0f - w) + pcm[i] * w;
+                    }
+                }
+
+                // Save tail for next crossfade
+                if ((int32_t)pcm.size() >= overlap_samples) {
+                    std::copy(pcm.end() - overlap_samples, pcm.end(), prev_tail.begin());
+                }
+
+                // Emit chunk (minus overlap that will be blended with next)
+                int32_t emit_samples = (int32_t)pcm.size() - overlap_samples;
+                if (emit_samples > 0) {
+                    on_chunk(pcm.data(), emit_samples, false);
+                }
+
+                frame_buffer.clear();
+                first_chunk = false;
+            }
+            return true;
+        },
+        params.language_id, params.repetition_penalty,
+        params.temperature, params.top_k);
+
+    // 6. Flush remaining frames
+    if (!frame_buffer.empty() && !decode_error) {
+        int32_t remaining_frames = (int32_t)frame_buffer.size() / n_codebooks;
+        if (remaining_frames > 0) {
+            std::vector<float> pcm;
+            if (audio_decoder_.decode(frame_buffer.data(), remaining_frames, pcm)) {
+                if (!first_chunk && overlap_samples > 0 && (int32_t)pcm.size() >= overlap_samples) {
+                    for (int32_t i = 0; i < overlap_samples; ++i) {
+                        float w = 0.5f * (1.0f - cosf(3.14159265f * (float)i / (float)overlap_samples));
+                        pcm[i] = prev_tail[i] * (1.0f - w) + pcm[i] * w;
+                    }
+                }
+                on_chunk(pcm.data(), (int32_t)pcm.size(), true);
+            }
+        }
+    } else if (!decode_error) {
+        // Emit the saved tail as final
+        on_chunk(prev_tail.data(), overlap_samples, true);
+    }
+
+    return !decode_error;
+}
+
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
     progress_callback_ = callback;
 }

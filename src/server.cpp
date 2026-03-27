@@ -77,6 +77,105 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
         return;
     }
 
+    // GET /api/tts/live?text=...&lang=de&voice=lina — streaming raw PCM s16le 24kHz mono
+    if (request.find("GET /api/tts/live") != std::string::npos) {
+        size_t q = request.find('?');
+        size_t end = request.find(" HTTP");
+        std::string query = (q != std::string::npos && end != std::string::npos) ?
+            request.substr(q + 1, end - q - 1) : "";
+
+        auto get_param = [&query](const std::string & key) -> std::string {
+            size_t pos = query.find(key + "=");
+            if (pos == std::string::npos) return "";
+            pos += key.size() + 1;
+            size_t amp = query.find('&', pos);
+            std::string val = (amp != std::string::npos) ? query.substr(pos, amp - pos) : query.substr(pos);
+            for (size_t i = 0; i < val.size(); i++) {
+                if (val[i] == '+') val[i] = ' ';
+                if (val[i] == '%' && i + 2 < val.size()) {
+                    int c; sscanf(val.c_str() + i + 1, "%2x", &c);
+                    val = val.substr(0, i) + (char)c + val.substr(i + 3);
+                }
+            }
+            return val;
+        };
+
+        std::string text = get_param("text");
+        std::string lang = get_param("lang");
+        std::string voice = get_param("voice");
+        if (voice.empty()) voice = "lina";
+        if (lang.empty()) lang = "de";
+
+        if (text.empty()) {
+            send_response(client_fd, 400, "text/plain", "Missing text param");
+            close(client_fd);
+            return;
+        }
+
+        qwen3_tts::tts_params params = default_params;
+        if      (lang == "de") params.language_id = 2053;
+        else if (lang == "en") params.language_id = 2050;
+        else if (lang == "zh") params.language_id = 2055;
+        else if (lang == "ja") params.language_id = 2058;
+        else if (lang == "ko") params.language_id = 2064;
+
+        // Load embedding
+        std::string emb_path = voices_dir + "/" + voice + ".bin";
+        std::vector<float> emb;
+        int32_t emb_size = 0;
+        FILE * ef = fopen(emb_path.c_str(), "rb");
+        if (ef) {
+            fread(&emb_size, 4, 1, ef);
+            emb.resize(emb_size);
+            fread(emb.data(), 4, emb_size, ef);
+            fclose(ef);
+        }
+
+        // Send HTTP header for raw PCM streaming
+        std::string hdr = "HTTP/1.1 200 OK\r\n"
+            "Content-Type: audio/pcm;rate=24000;channels=1;bits=16\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Connection: close\r\n\r\n";
+        write(client_fd, hdr.c_str(), hdr.size());
+
+        int32_t total_samples = 0;
+
+        tts.synthesize_streaming(text,
+            emb.empty() ? nullptr : emb.data(), emb_size, params,
+            [&](const float * pcm, int32_t n_samples, bool is_final) {
+                // Convert float → int16 PCM
+                std::vector<int16_t> buf(n_samples);
+                for (int32_t i = 0; i < n_samples; ++i) {
+                    float s = pcm[i];
+                    if (s > 1.0f) s = 1.0f;
+                    if (s < -1.0f) s = -1.0f;
+                    buf[i] = (int16_t)(s * 32767.0f);
+                }
+
+                // HTTP chunked encoding
+                char chunk_hdr[32];
+                int chunk_len = n_samples * 2;
+                int hdr_len = snprintf(chunk_hdr, sizeof(chunk_hdr), "%x\r\n", chunk_len);
+                write(client_fd, chunk_hdr, hdr_len);
+                write(client_fd, buf.data(), chunk_len);
+                write(client_fd, "\r\n", 2);
+
+                total_samples += n_samples;
+
+                if (is_final) {
+                    write(client_fd, "0\r\n\r\n", 5);  // chunked terminator
+                }
+            },
+            4,    // chunk_frames
+            512   // overlap_samples
+        );
+
+        float dur = (float)total_samples / 24000.0f;
+        fprintf(stderr, "[TTS/live] \"%s\" %.1fs streamed\n", text.c_str(), dur);
+        close(client_fd);
+        return;
+    }
+
     // GET /api/tts/stream?text=...&lang=de&voice=lina — returns raw WAV directly
     if (request.find("GET /api/tts/stream") != std::string::npos) {
         // Parse query params from URL
