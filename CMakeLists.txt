@@ -187,6 +187,14 @@ target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
 )
 
+# Persistent server executable
+add_executable(qwen3-tts-server
+    src/server.cpp
+)
+target_link_libraries(qwen3-tts-server PRIVATE
+    qwen3_tts
+)
+
 # Test executable for tokenizer
 add_executable(test_tokenizer
     tests/test_tokenizer.cpp
