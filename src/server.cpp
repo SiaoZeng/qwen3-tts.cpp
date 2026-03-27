@@ -23,6 +23,15 @@ static bool safe_write(int fd, const void * data, size_t len) {
     return n >= 0 && (size_t)n == len;
 }
 
+// Graceful socket close: shutdown write, drain, then close
+static void graceful_close(int fd) {
+    shutdown(fd, SHUT_WR);
+    // Drain any remaining data from client (prevents RST)
+    char drain[1024];
+    while (read(fd, drain, sizeof(drain)) > 0) {}
+    close(fd);
+}
+
 // Simple JSON value extractor (no dependency needed)
 static std::string json_get_string(const std::string & json, const std::string & key) {
     std::string search = "\"" + key + "\"";
@@ -79,7 +88,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
     // GET /health
     if (request.find("GET /health") == 0) {
         send_response(client_fd, 200, "text/plain", "OK");
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
 
@@ -114,7 +123,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
 
         if (text.empty()) {
             send_response(client_fd, 400, "text/plain", "Missing text param");
-            close(client_fd);
+            graceful_close(client_fd);
             return;
         }
 
@@ -180,7 +189,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
 
         float dur = (float)total_samples / 24000.0f;
         fprintf(stderr, "[TTS/live] \"%s\" %.1fs streamed\n", text.c_str(), dur);
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
 
@@ -217,7 +226,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
 
         if (text.empty()) {
             send_response(client_fd, 400, "text/plain", "Missing text param");
-            close(client_fd);
+            graceful_close(client_fd);
             return;
         }
 
@@ -241,7 +250,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
 
         if (!result.success) {
             send_response(client_fd, 500, "text/plain", result.error_msg);
-            close(client_fd);
+            graceful_close(client_fd);
             return;
         }
 
@@ -277,7 +286,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
         std::string h = hdr.str();
         write(client_fd, h.c_str(), h.size());
         write(client_fd, wav.data(), wav.size());
-        close(client_fd);
+        graceful_close(client_fd);
 
         float dur = (float)ns / sr;
         fprintf(stderr, "[TTS/stream] \"%s\" %.1fs in %lldms\n",
@@ -288,7 +297,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
     // POST /api/tts
     if (request.find("POST /api/tts") == std::string::npos) {
         send_response(client_fd, 404, "text/plain", "Not Found");
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
 
@@ -296,7 +305,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
     size_t body_start = request.find("\r\n\r\n");
     if (body_start == std::string::npos) {
         send_response(client_fd, 400, "application/json", "{\"success\":false,\"message\":\"No body\"}");
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
     std::string json_body = request.substr(body_start + 4);
@@ -307,7 +316,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
 
     if (text.empty()) {
         send_response(client_fd, 400, "application/json", "{\"success\":false,\"message\":\"Missing text\"}");
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
 
@@ -344,7 +353,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
     if (!result.success) {
         std::string err = "{\"success\":false,\"message\":\"" + result.error_msg + "\"}";
         send_response(client_fd, 500, "application/json", err);
-        close(client_fd);
+        graceful_close(client_fd);
         return;
     }
 
@@ -384,7 +393,7 @@ static void handle_client(int client_fd, qwen3_tts::Qwen3TTS & tts,
     std::string json_resp = "{\"success\":true,\"audio_base64\":\"" + b64 + "\",\"message\":null}";
 
     send_response(client_fd, 200, "application/json", json_resp);
-    close(client_fd);
+    graceful_close(client_fd);
 
     float duration = (float)result.audio.size() / result.sample_rate;
     fprintf(stderr, "[TTS] \"%s\" lang=%s voice=%s | %.1fs audio in %lldms (RTF %.2f)\n",
