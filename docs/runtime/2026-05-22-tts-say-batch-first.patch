@@ -1,0 +1,317 @@
+--- a/tts-say
++++ b/tts-say
+@@ -3,134 +3,84 @@
+ 
+ VOICE_DIR="${TTS_VOICE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/qwen3-tts/voices}"
+ TTS_URL="${TTS_URL:-http://127.0.0.1:8007/api/tts/stream}"
+-TTS_LIVE_URL="${TTS_LIVE_URL:-http://127.0.0.1:8007/api/tts/live}"
+-TTS_SESSION_URL="${TTS_SESSION_URL:-http://127.0.0.1:8007/api/tts/live-sessions}"
+-TTS_CONTROL_TIMEOUT_SEC="${TTS_CONTROL_TIMEOUT_SEC:-15}"
++TTS_HEALTH_URL="${TTS_HEALTH_URL:-}"
++TTS_READY_RETRY_COUNT="${TTS_READY_RETRY_COUNT:-20}"
++TTS_READY_RETRY_INTERVAL_SEC="${TTS_READY_RETRY_INTERVAL_SEC:-0.5}"
+ TTS_STREAM_TIMEOUT_SEC="${TTS_STREAM_TIMEOUT_SEC:-120}"
+-TTS_LIVE_RUNTIME_MAX_SEC="${TTS_LIVE_RUNTIME_MAX_SEC:-150}"
+-TTS_LIVE_PLAYER="${TTS_LIVE_PLAYER:-auto}"
++TTS_BATCH_PLAYER_CMD="${TTS_BATCH_PLAYER_CMD:-}"
+ VOICE="${TTS_DEFAULT_VOICE:-lina}"
+ LANGUAGE="${TTS_DEFAULT_LANG:-de}"
+ OUTPUT=""
+ PLAY=0
++TEMP_OUTPUT=""
+ 
+-self_path() {
+-    python3 - <<'PY' "$0"
+-import os, sys
+-print(os.path.realpath(sys.argv[1]))
++cleanup() {
++    if [[ -n "$TEMP_OUTPUT" && -f "$TEMP_OUTPUT" ]]; then
++        rm -f "$TEMP_OUTPUT"
++    fi
++}
++trap cleanup EXIT
++
++health_url_from_tts_url() {
++    python3 - <<'PY' "$1"
++from urllib.parse import urlsplit, urlunsplit
++import sys
++url = urlsplit(sys.argv[1])
++print(urlunsplit((url.scheme, url.netloc, '/health', '', '')))
+ PY
+ }
+ 
+-choose_live_player() {
+-    if [[ -n "$TTS_LIVE_PLAYER" && "$TTS_LIVE_PLAYER" != "auto" ]]; then
+-        printf '%s\n' "$TTS_LIVE_PLAYER"
+-        return 0
+-    fi
+-    if command -v pw-cat >/dev/null 2>&1; then
+-        printf '%s\n' 'pw-cat --playback --raw --rate 24000 --channels 1 --format s16 -'
+-        return 0
+-    fi
+-    if command -v pacat >/dev/null 2>&1; then
+-        printf '%s\n' 'pacat --playback --raw --rate=24000 --channels=1 --format=s16le'
+-        return 0
+-    fi
+-    if command -v aplay >/dev/null 2>&1; then
+-        printf '%s\n' 'aplay -f S16_LE -r 24000 -c 1 -q -'
+-        return 0
++wait_for_health() {
++    local health_url
++    if [[ -n "$TTS_HEALTH_URL" ]]; then
++        health_url="$TTS_HEALTH_URL"
++    else
++        health_url="$(health_url_from_tts_url "$TTS_URL")"
+     fi
+-    return 1
+-}
+ 
+-play_live() {
+-    local cmd
+-    cmd="$(choose_live_player)" || {
+-        printf 'No suitable live playback command found\n' >&2
+-        return 1
+-    }
+-    eval "$cmd"
++    python3 - <<'PY' "$health_url" "$TTS_READY_RETRY_COUNT" "$TTS_READY_RETRY_INTERVAL_SEC"
++import json
++import sys
++import time
++import urllib.request
++import urllib.error
++
++url = sys.argv[1]
++retries = int(float(sys.argv[2]))
++interval = float(sys.argv[3])
++last_error = 'unknown'
++for attempt in range(retries):
++    try:
++        with urllib.request.urlopen(url, timeout=3) as resp:
++            body = resp.read().decode('utf-8', 'replace')
++        data = json.loads(body)
++        if data.get('status') == 'ok':
++            sys.exit(0)
++        last_error = f"status={data.get('status')}"
++    except Exception as exc:
++        last_error = str(exc)
++    if attempt + 1 < retries:
++        time.sleep(interval)
++print(f"service not ready via {url}: {last_error}", file=sys.stderr)
++sys.exit(1)
++PY
+ }
+ 
+ play_file() {
+     local file_path="$1"
++    if [[ -n "$TTS_BATCH_PLAYER_CMD" ]]; then
++        FILE_PATH="$file_path" bash -lc "$TTS_BATCH_PLAYER_CMD"
++        return
++    fi
+     if command -v paplay >/dev/null 2>&1; then
+         paplay "$file_path"
++    elif command -v pw-play >/dev/null 2>&1; then
++        pw-play "$file_path"
+     else
+         aplay -q "$file_path"
+     fi
+ }
+ 
+-stream_ws_stdout() {
+-    python3 - <<'PY' "$1" "$2"
+-import base64, hashlib, os, socket, sys
+-ws_url = sys.argv[1]
+-timeout = float(sys.argv[2])
+-if not ws_url.startswith('ws://127.0.0.1:'):
+-    raise SystemExit('unsupported ws_url')
+-rest = ws_url[len('ws://127.0.0.1:'):]
+-port, path = rest.split('/', 1)
+-path = '/' + path
+-sock = socket.create_connection(('127.0.0.1', int(port)), timeout=timeout)
+-key = base64.b64encode(os.urandom(16)).decode()
+-request = (
+-    f'GET {path} HTTP/1.1\r\n'
+-    f'Host: 127.0.0.1:{port}\r\n'
+-    'Upgrade: websocket\r\n'
+-    'Connection: Upgrade\r\n'
+-    f'Sec-WebSocket-Key: {key}\r\n'
+-    'Sec-WebSocket-Version: 13\r\n\r\n'
+-)
+-sock.sendall(request.encode())
+-response = sock.recv(4096)
+-if b'101 Switching Protocols' not in response:
+-    raise SystemExit('websocket upgrade failed')
+-expected = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
+-if expected not in response:
+-    raise SystemExit('websocket accept mismatch')
+-
+-def recv_exact(n: int) -> bytes:
+-    data = b''
+-    while len(data) < n:
+-        chunk = sock.recv(n - len(data))
+-        if not chunk:
+-            return data
+-        data += chunk
+-    return data
+-
+-saw_audio = False
+-try:
+-    while True:
+-        header = recv_exact(2)
+-        if len(header) != 2:
+-            break
+-        opcode = header[0] & 0x0F
+-        payload_len = header[1] & 0x7F
+-        if payload_len == 126:
+-            payload_len = int.from_bytes(recv_exact(2), 'big')
+-        elif payload_len == 127:
+-            payload_len = int.from_bytes(recv_exact(8), 'big')
+-        payload = recv_exact(payload_len)
+-        if len(payload) != payload_len:
+-            break
+-        if opcode == 2:
+-            sys.stdout.buffer.write(payload)
+-            sys.stdout.buffer.flush()
+-            saw_audio = True
+-        elif opcode == 8:
+-            break
+-        elif opcode == 9:
+-            continue
+-        elif opcode == 1:
+-            continue
+-finally:
+-    try:
+-        sock.close()
+-    except OSError:
+-        pass
+-if not saw_audio:
+-    raise SystemExit('no audio frames received')
+-PY
+-}
+-
+ usage() {
+     cat <<'EOF'
+ Usage:
+@@ -147,15 +97,16 @@
+   --help, -h          Show this help
+ 
+ Behavior:
+-  Without --output, playback runs detached via systemd-run using live session creation and a WebSocket attach.
+-  With --output, synthesis uses /api/tts/stream and waits for the file to finish.
++  Without --output, synthesis uses the batch WAV endpoint, plays inline, and prints 'ok' only after successful playback.
++  With --output, synthesis waits for the file to finish and prints the output path.
+ 
+ Environment overrides:
+-  TTS_SESSION_URL            Live session create URL
+-  TTS_CONTROL_TIMEOUT_SEC    Timeout for session create/delete calls
+-  TTS_STREAM_TIMEOUT_SEC     Timeout for live streaming attach
+-  TTS_LIVE_RUNTIME_MAX_SEC   RuntimeMaxSec for detached live jobs
+-  TTS_LIVE_PLAYER            Explicit live playback command or 'auto'
++  TTS_URL                     Batch synthesis endpoint
++  TTS_HEALTH_URL              Optional readiness endpoint override
++  TTS_READY_RETRY_COUNT       Readiness retry attempts (default: 20)
++  TTS_READY_RETRY_INTERVAL_SEC Readiness retry interval seconds (default: 0.5)
++  TTS_STREAM_TIMEOUT_SEC      Batch request timeout seconds
++  TTS_BATCH_PLAYER_CMD        Explicit playback command for tests
+ EOF
+ }
+ 
+@@ -194,29 +145,6 @@
+     exit 1
+ }
+ 
+-if [[ "${TTS_SAY_INTERNAL_LIVE:-0}" == "1" ]]; then
+-    : "${SESSION_ID:?missing SESSION_ID}"
+-    : "${WS_URL:?missing WS_URL}"
+-    : "${SESSION_BASE_URL:?missing SESSION_BASE_URL}"
+-
+-    cleanup_live_session() {
+-        curl -fsS --max-time "$TTS_CONTROL_TIMEOUT_SEC" -X DELETE "$SESSION_BASE_URL/$SESSION_ID" >/dev/null 2>&1 || true
+-    }
+-    trap cleanup_live_session EXIT
+-
+-    if stream_ws_stdout "$WS_URL" "$TTS_STREAM_TIMEOUT_SEC" | play_live; then
+-        exit 0
+-    fi
+-
+-    if [[ -n "${STREAM_URL:-}" ]]; then
+-        if curl -fsSN --max-time "$TTS_STREAM_TIMEOUT_SEC" "$STREAM_URL" | play_live; then
+-            exit 0
+-        fi
+-    fi
+-
+-    exit 1
+-fi
+-
+ if [[ $# -eq 0 ]]; then
+     usage
+     exit 1
+@@ -285,51 +213,13 @@
+ 
+ if [[ -z "$OUTPUT" ]]; then
+     PLAY=1
++    TEMP_OUTPUT="$(mktemp --suffix=.wav)"
++    OUTPUT="$TEMP_OUTPUT"
+ fi
+ 
+-if [[ -z "$OUTPUT" && "$PLAY" -eq 1 ]]; then
+-    payload_file="$(mktemp)"
+-    trap 'rm -f "$payload_file"' EXIT
+-    python3 - <<'PY' "$payload_file" "$TEXT" "$LANGUAGE" "$VOICE"
+-import json, sys
+-with open(sys.argv[1], 'w', encoding='utf-8') as f:
+-    json.dump({
+-        'text': sys.argv[2],
+-        'language': sys.argv[3],
+-        'voice': sys.argv[4],
+-        'attach_policy': 'manual',
+-    }, f)
+-PY
+-    create_json="$(curl -fsS --max-time "$TTS_CONTROL_TIMEOUT_SEC" -H 'Content-Type: application/json' -X POST --data-binary @"$payload_file" "$TTS_SESSION_URL")" || die "Failed to create live session"
+-    read -r SESSION_ID WS_URL STREAM_URL <<EOF
+-$(python3 - <<'PY' "$create_json"
+-import json, sys
+-obj=json.loads(sys.argv[1])
+-print(obj['session_id'], obj['ws_url'], obj.get('stream_url',''))
+-PY
+-)
+-EOF
+-    [[ -n "$SESSION_ID" && -n "$WS_URL" ]] || die "Live session response missing session_id or ws_url"
+-    SESSION_BASE_URL="${TTS_SESSION_URL%/api/tts/live-sessions}"
+-    SELF="$(self_path)"
+-    systemd-run --user --no-block --collect -q \
+-        --property="Type=exec" \
+-        --property="RuntimeMaxSec=${TTS_LIVE_RUNTIME_MAX_SEC}s" \
+-        env \
+-        TTS_SAY_INTERNAL_LIVE=1 \
+-        TTS_CONTROL_TIMEOUT_SEC="$TTS_CONTROL_TIMEOUT_SEC" \
+-        TTS_STREAM_TIMEOUT_SEC="$TTS_STREAM_TIMEOUT_SEC" \
+-        TTS_LIVE_PLAYER="$TTS_LIVE_PLAYER" \
+-        SESSION_ID="$SESSION_ID" \
+-        WS_URL="$WS_URL" \
+-        STREAM_URL="$STREAM_URL" \
+-        SESSION_BASE_URL="$SESSION_BASE_URL/api/tts/live-sessions" \
+-        "$SELF"
+-    printf 'ok\n'
+-    exit 0
+-fi
++wait_for_health
+ 
+-curl -fsS --max-time 120 --get \
++curl -fsS --max-time "$TTS_STREAM_TIMEOUT_SEC" --get \
+     --data-urlencode "text=$TEXT" \
+     --data-urlencode "lang=$LANGUAGE" \
+     --data-urlencode "voice=$VOICE" \
+@@ -337,7 +227,11 @@
+     -o "$OUTPUT"
+ 
+ if [[ "$PLAY" -eq 1 ]]; then
+-    play_file "$OUTPUT" 2>/dev/null || true
++    play_file "$OUTPUT"
+ fi
+ 
+-printf '%s\n' "$OUTPUT"
++if [[ -n "$TEMP_OUTPUT" ]]; then
++    printf 'ok\n'
++else
++    printf '%s\n' "$OUTPUT"
++fi
