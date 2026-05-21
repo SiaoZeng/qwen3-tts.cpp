@@ -1,6 +1,9 @@
 #include "qwen3_tts.h"
+#include "crossfade.h"
 #include "gguf_loader.h"
 
+#include <algorithm>
+#include <deque>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -8,6 +11,7 @@
 #include <fstream>
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -125,7 +129,17 @@ bool Qwen3TTS::load_models(const std::string & model_dir) {
     } else {
         tts_model_path = f16_path;
     }
-    std::string tokenizer_model_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+    // Prefer quantized tokenizer too
+    std::string tokenizer_model_path;
+    std::string tok_q8_path = model_dir + "/qwen3-tts-tokenizer-q8_0.gguf";
+    std::string tok_f16_path = model_dir + "/qwen3-tts-tokenizer-f16.gguf";
+    FILE * tok_check = fopen(tok_q8_path.c_str(), "r");
+    if (tok_check) {
+        fclose(tok_check);
+        tokenizer_model_path = tok_q8_path;
+    } else {
+        tokenizer_model_path = tok_f16_path;
+    }
     tts_model_path_ = tts_model_path;
     decoder_model_path_ = tokenizer_model_path;
     encoder_loaded_ = false;
@@ -499,6 +513,216 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
     
     return result;
+}
+
+bool Qwen3TTS::synthesize_streaming(const std::string & text,
+                                     const float * embedding, int32_t embedding_size,
+                                     const tts_params & params,
+                                     chunk_callback_t on_chunk,
+                                     int32_t chunk_frames,
+                                     int32_t overlap_samples) {
+    (void)embedding_size;
+    (void)overlap_samples;
+
+    auto getenv_int_or = [](const char * name, int32_t fallback) {
+        const char * val = getenv(name);
+        if (!val || !*val) return fallback;
+        char * end = nullptr;
+        long parsed = strtol(val, &end, 10);
+        if (end == val || *end != '\0' || parsed <= 0) return fallback;
+        return (int32_t)parsed;
+    };
+    auto getenv_nonnegative_int_or = [](const char * name, int32_t fallback) {
+        const char * val = getenv(name);
+        if (!val || !*val) return fallback;
+        char * end = nullptr;
+        long parsed = strtol(val, &end, 10);
+        if (end == val || *end != '\0' || parsed < 0) return fallback;
+        return (int32_t)parsed;
+    };
+    const bool trace_window_timing = getenv("QWEN3_TTS_TRACE_WINDOW_TIMING") != nullptr;
+
+    // 1. Tokenize
+    std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
+    if (text_tokens.empty()) {
+        error_msg_ = "Failed to tokenize text";
+        return false;
+    }
+
+    // 2. Ensure decoder is loaded
+    if (!decoder_loaded_) {
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            error_msg_ = "Failed to load vocoder: " + audio_decoder_.get_error();
+            return false;
+        }
+        decoder_loaded_ = true;
+    }
+
+    // 3. Ensure transformer is loaded
+    if (!transformer_loaded_) {
+        if (!transformer_.load_model(tts_model_path_)) {
+            error_msg_ = "Failed to load transformer: " + transformer_.get_error();
+            return false;
+        }
+        transformer_loaded_ = true;
+    }
+    transformer_.clear_kv_cache();
+
+    const int32_t n_codebooks = transformer_.get_config().n_codebooks;
+    const int32_t context_frames = getenv_int_or("QWEN3_TTS_STREAM_CONTEXT_FRAMES", std::max<int32_t>(1, chunk_frames));
+    const int32_t lookahead_frames = getenv_nonnegative_int_or("QWEN3_TTS_STREAM_LOOKAHEAD_FRAMES", std::max<int32_t>(1, chunk_frames));
+    const int32_t startup_prebuffer_chunks = getenv_int_or("QWEN3_TTS_STREAM_STARTUP_PREBUFFER_CHUNKS", 2);
+
+    if (chunk_frames <= 0) {
+        error_msg_ = "Invalid streaming chunk size";
+        return false;
+    }
+    // 4. Streaming state
+    std::vector<int32_t> all_codes;
+    bool cancelled = false;
+    bool callback_failed = false;
+
+    auto emit_window = [&](int32_t window_start_frame,
+                           int32_t emit_start_frame,
+                           int32_t emit_end_frame,
+                           bool is_final) -> bool {
+        const int32_t total_frames = (int32_t)all_codes.size() / n_codebooks;
+        const int32_t window_end_frame = is_final
+            ? total_frames
+            : std::min(total_frames, emit_end_frame + lookahead_frames);
+
+        if (window_end_frame <= window_start_frame || emit_end_frame <= emit_start_frame) {
+            return true;
+        }
+
+        auto window_start_tp = std::chrono::steady_clock::now();
+        std::vector<float> pcm;
+        if (!audio_decoder_.decode(all_codes.data() + (size_t)window_start_frame * n_codebooks,
+                                   window_end_frame - window_start_frame,
+                                   pcm)) {
+            error_msg_ = std::string(is_final ?
+                "Failed to decode final streaming window: " :
+                "Failed to decode streaming window: ") + audio_decoder_.get_error();
+            return false;
+        }
+        auto window_decode_done_tp = std::chrono::steady_clock::now();
+
+        auto prefix_samples_for = [&](int32_t prefix_frames, int32_t fallback) -> int32_t {
+            if (prefix_frames <= 0) {
+                return 0;
+            }
+            if (prefix_frames >= window_end_frame - window_start_frame) {
+                return fallback;
+            }
+
+            const int32_t prefix_samples = audio_decoder_.sample_count_for_frames(prefix_frames);
+            if (trace_window_timing) {
+                fprintf(stderr,
+                        "[TTS/window-prefix] frames=%d samples=%d ms=0.00 cached=1\n",
+                        prefix_frames,
+                        prefix_samples);
+            }
+            return prefix_samples;
+        };
+
+        const int32_t local_emit_start = prefix_samples_for(emit_start_frame - window_start_frame, 0);
+        if (local_emit_start < 0) {
+            return false;
+        }
+
+        const int32_t local_emit_end = prefix_samples_for(emit_end_frame - window_start_frame, (int32_t)pcm.size());
+        if (local_emit_end < 0) {
+            return false;
+        }
+
+        if (local_emit_end <= local_emit_start) {
+            return true;
+        }
+
+        if (trace_window_timing) {
+            const double window_decode_ms = std::chrono::duration<double, std::milli>(window_decode_done_tp - window_start_tp).count();
+            fprintf(stderr,
+                    "[TTS/window] window=[%d,%d) emit=[%d,%d) pcm=%zu emit_samples=%d decode_ms=%.2f final=%d\n",
+                    window_start_frame,
+                    window_end_frame,
+                    emit_start_frame,
+                    emit_end_frame,
+                    pcm.size(),
+                    local_emit_end - local_emit_start,
+                    window_decode_ms,
+                    is_final ? 1 : 0);
+        }
+
+        if (!on_chunk(pcm.data() + local_emit_start, local_emit_end - local_emit_start, is_final)) {
+            cancelled = true;
+            return false;
+        }
+        return true;
+    };
+
+    int32_t emitted_frames = 0;
+
+    // 5. Generate with frame callback
+    bool generate_ok = transformer_.generate_streaming(text_tokens.data(), (int32_t)text_tokens.size(),
+        embedding, params.max_audio_tokens,
+        [&](const int32_t * frame_codes, int32_t n_cb, int32_t frame_idx) -> bool {
+            (void)frame_idx;
+            for (int i = 0; i < n_cb; ++i)
+                all_codes.push_back(frame_codes[i]);
+
+            const int32_t total_frames = (int32_t)all_codes.size() / n_codebooks;
+            while (total_frames >= emitted_frames + chunk_frames + startup_prebuffer_chunks * lookahead_frames) {
+                const int32_t emit_end_frame = emitted_frames + chunk_frames;
+                const int32_t window_start_frame = std::max<int32_t>(0, emitted_frames - context_frames);
+                if (!emit_window(window_start_frame, emitted_frames, emit_end_frame, false)) {
+                    callback_failed = true;
+                    return false;
+                }
+                emitted_frames = emit_end_frame;
+            }
+            return true;
+        },
+        params.language_id, params.repetition_penalty,
+        params.temperature, params.top_k);
+
+    if (callback_failed) {
+        audio_decoder_.finish_streaming();
+        if (cancelled) {
+            error_msg_ = "Streaming cancelled by callback";
+        }
+        return false;
+    }
+
+    // 6. Flush remaining frames and mark the actual last chunk as final.
+    if (!generate_ok) {
+        audio_decoder_.finish_streaming();
+        if (cancelled) {
+            error_msg_ = "Streaming cancelled by callback";
+            return false;
+        }
+        error_msg_ = transformer_.get_error();
+        return false;
+    }
+
+    if (!cancelled) {
+        const int32_t total_frames = (int32_t)all_codes.size() / n_codebooks;
+        if (total_frames > emitted_frames) {
+            const int32_t window_start_frame = std::max<int32_t>(0, emitted_frames - context_frames);
+            if (!emit_window(window_start_frame, emitted_frames, total_frames, true)) {
+                audio_decoder_.finish_streaming();
+                return false;
+            }
+        }
+    }
+
+    audio_decoder_.finish_streaming();
+
+    if (cancelled) {
+        error_msg_ = "Streaming cancelled by callback";
+        return false;
+    }
+
+    return true;
 }
 
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {

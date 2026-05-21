@@ -163,6 +163,15 @@ target_link_libraries(qwen3_tts PUBLIC
     Threads::Threads
 )
 
+set_property(TARGET
+    text_tokenizer
+    tts_transformer
+    audio_tokenizer_encoder
+    audio_tokenizer_decoder
+    qwen3_tts
+    PROPERTY POSITION_INDEPENDENT_CODE ON
+)
+
 # Shared library with C API (for Nim FFI)
 add_library(qwen3tts_shared SHARED
     src/qwen3tts_c_api.cpp
@@ -184,6 +193,14 @@ add_executable(qwen3-tts-cli
     src/main.cpp
 )
 target_link_libraries(qwen3-tts-cli PRIVATE
+    qwen3_tts
+)
+
+# Persistent server executable
+add_executable(qwen3-tts-server
+    src/server.cpp
+)
+target_link_libraries(qwen3-tts-server PRIVATE
     qwen3_tts
 )
 
@@ -223,6 +240,14 @@ target_link_libraries(test_decoder PRIVATE
     Threads::Threads
 )
 
+add_executable(test_streaming_pipeline
+    tests/test_streaming_pipeline.cpp
+)
+target_link_libraries(test_streaming_pipeline PRIVATE
+    qwen3_tts
+    Threads::Threads
+)
+
 # Install targets
 install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli
     ARCHIVE DESTINATION lib
@@ -243,19 +268,80 @@ install(FILES
 
 # CTest support
 enable_testing()
+
+set(QWEN3_TTS_LOCAL_SHARE "$ENV{HOME}/.local/share/qwen3-tts")
+set(QWEN3_TTS_TEST_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models")
+if(EXISTS "${QWEN3_TTS_LOCAL_SHARE}/models/qwen3-tts-0.6b-f16.gguf")
+    set(QWEN3_TTS_TEST_MODEL_DIR "${QWEN3_TTS_LOCAL_SHARE}/models")
+endif()
+
+set(QWEN3_TTS_TEST_TTS_MODEL "${QWEN3_TTS_TEST_MODEL_DIR}/qwen3-tts-0.6b-f16.gguf")
+set(QWEN3_TTS_TEST_TOKENIZER_MODEL "${QWEN3_TTS_TEST_MODEL_DIR}/qwen3-tts-tokenizer-f16.gguf")
+set(QWEN3_TTS_TEST_AUDIO "${CMAKE_CURRENT_SOURCE_DIR}/clone.wav")
+set(QWEN3_TTS_TEST_ENCODER_REF "${CMAKE_CURRENT_SOURCE_DIR}/reference/ref_audio_embedding.bin")
+set(QWEN3_TTS_TEST_TRANSFORMER_TOKENS "${CMAKE_CURRENT_SOURCE_DIR}/reference/det_text_tokens.bin")
+set(QWEN3_TTS_TEST_TRANSFORMER_SPEAKER "${CMAKE_CURRENT_SOURCE_DIR}/reference/det_speaker_embedding.bin")
+set(QWEN3_TTS_TEST_DECODER_CODES "${CMAKE_CURRENT_SOURCE_DIR}/reference/speech_codes.bin")
+
 add_test(NAME tokenizer_test
     COMMAND test_tokenizer
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_test(NAME encoder_test
-    COMMAND test_encoder --tokenizer models/qwen3-tts-0.6b-f16.gguf --audio clone.wav --reference reference/ref_audio_embedding.bin
+if(EXISTS "${QWEN3_TTS_TEST_TTS_MODEL}" AND EXISTS "${QWEN3_TTS_TEST_AUDIO}")
+    set(QWEN3_TTS_ENCODER_TEST_CMD test_encoder --tokenizer ${QWEN3_TTS_TEST_TTS_MODEL} --audio ${QWEN3_TTS_TEST_AUDIO})
+    if(EXISTS "${QWEN3_TTS_TEST_ENCODER_REF}")
+        list(APPEND QWEN3_TTS_ENCODER_TEST_CMD --reference ${QWEN3_TTS_TEST_ENCODER_REF})
+    endif()
+    add_test(NAME encoder_test
+        COMMAND ${QWEN3_TTS_ENCODER_TEST_CMD}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "Skipping encoder_test: required model/audio artifacts not found")
+endif()
+
+if(EXISTS "${QWEN3_TTS_TEST_TTS_MODEL}" AND EXISTS "${QWEN3_TTS_TEST_TRANSFORMER_TOKENS}" AND EXISTS "${QWEN3_TTS_TEST_TRANSFORMER_SPEAKER}")
+    add_test(NAME transformer_test
+        COMMAND test_transformer --model ${QWEN3_TTS_TEST_TTS_MODEL} --ref-dir ${CMAKE_CURRENT_SOURCE_DIR}/reference/
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "Skipping transformer_test: required model/reference artifacts not found")
+endif()
+
+if(EXISTS "${QWEN3_TTS_TEST_TOKENIZER_MODEL}" AND EXISTS "${QWEN3_TTS_TEST_DECODER_CODES}")
+    set(QWEN3_TTS_DECODER_TEST_CMD test_decoder --tokenizer ${QWEN3_TTS_TEST_TOKENIZER_MODEL} --codes ${QWEN3_TTS_TEST_DECODER_CODES})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/reference/decoded_audio.bin")
+        list(APPEND QWEN3_TTS_DECODER_TEST_CMD --reference ${CMAKE_CURRENT_SOURCE_DIR}/reference/decoded_audio.bin)
+    endif()
+    add_test(NAME decoder_test
+        COMMAND ${QWEN3_TTS_DECODER_TEST_CMD}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "Skipping decoder_test: required model/code artifacts not found")
+endif()
+add_test(NAME live_abort_recovery_test
+    COMMAND ${CMAKE_COMMAND} -E env QWEN3_TTS_TEST_PORT=19001 bash tests/test_live_abort_recovery.sh ${CMAKE_CURRENT_BINARY_DIR}/qwen3-tts-server
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_test(NAME transformer_test
-    COMMAND test_transformer
+add_test(NAME post_split_body_test
+    COMMAND ${CMAKE_COMMAND} -E env QWEN3_TTS_TEST_PORT=19002 bash tests/test_post_split_body.sh ${CMAKE_CURRENT_BINARY_DIR}/qwen3-tts-server
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_test(NAME decoder_test
-    COMMAND test_decoder
+add_test(NAME post_incomplete_body_test
+    COMMAND ${CMAKE_COMMAND} -E env QWEN3_TTS_TEST_PORT=19003 bash tests/test_post_incomplete_body.sh ${CMAKE_CURRENT_BINARY_DIR}/qwen3-tts-server
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+add_test(NAME live_duration_matches_stream_test
+    COMMAND ${CMAKE_COMMAND} -E env QWEN3_TTS_TEST_PORT=19004 bash tests/test_live_duration_matches_stream.sh ${CMAKE_CURRENT_BINARY_DIR}/qwen3-tts-server
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+if(EXISTS "${QWEN3_TTS_TEST_MODEL_DIR}" AND EXISTS "${QWEN3_TTS_LOCAL_SHARE}/voices/lina.bin")
+    add_test(NAME streaming_pipeline_test
+        COMMAND test_streaming_pipeline --models ${QWEN3_TTS_TEST_MODEL_DIR} --embedding ${QWEN3_TTS_LOCAL_SHARE}/voices/lina.bin
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+else()
+    message(STATUS "Skipping streaming_pipeline_test: required model/embedding artifacts not found")
+endif()

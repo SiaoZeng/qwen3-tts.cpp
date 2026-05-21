@@ -173,6 +173,20 @@ public:
     // Returns: audio samples normalized to [-1, 1] at 24kHz
     bool decode(const int32_t * codes, int32_t n_frames,
                 std::vector<float> & samples);
+
+    // Prepare cached graph state for fixed-size streaming decode chunks.
+    bool init_streaming(int32_t chunk_frames);
+
+    // Decode one streaming chunk. If n_frames differs from the cached size,
+    // this call falls back to a one-shot decode and invalidates the cache.
+    bool decode_chunk(const int32_t * codes, int32_t n_frames,
+                      std::vector<float> & samples);
+
+    // Drop cached streaming graph state.
+    void finish_streaming();
+
+    // Number of output PCM samples for a decoder input length.
+    int32_t sample_count_for_frames(int32_t n_frames) const;
     
     const audio_decoder_config & get_config() const { return model_.config; }
     
@@ -181,6 +195,13 @@ public:
 private:
     // Build computation graph for decoding
     struct ggml_cgraph * build_graph(int32_t n_frames);
+
+    bool decode_graph(struct ggml_cgraph * gf,
+                      const int32_t * codes,
+                      int32_t n_frames,
+                      std::vector<float> & samples);
+
+    bool analyze_output_geometry();
     
     // Apply Snake activation: x + (1/alpha) * sin^2(alpha * x)
     struct ggml_tensor * apply_snake(struct ggml_context * ctx,
@@ -224,6 +245,12 @@ private:
     audio_decoder_model model_;
     audio_decoder_state state_;
     std::string error_msg_;
+
+    struct ggml_cgraph * streaming_graph_ = nullptr;
+    int32_t streaming_chunk_frames_ = 0;
+    bool streaming_initialized_ = false;
+    int32_t sample_stride_ = 0;
+    int32_t sample_offset_ = 0;
     
     // Temporary storage for codes input
     std::vector<int32_t> codes_buf_;

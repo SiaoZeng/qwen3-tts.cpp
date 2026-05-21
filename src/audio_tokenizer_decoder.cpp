@@ -18,6 +18,7 @@ AudioTokenizerDecoder::~AudioTokenizerDecoder() {
 }
 
 void AudioTokenizerDecoder::unload_model() {
+    finish_streaming();
     free_audio_decoder_model(model_);
     
     if (state_.sched) {
@@ -35,6 +36,47 @@ void AudioTokenizerDecoder::unload_model() {
 
     state_.compute_meta.clear();
     codes_buf_.clear();
+}
+
+void AudioTokenizerDecoder::finish_streaming() {
+    streaming_graph_ = nullptr;
+    streaming_chunk_frames_ = 0;
+    streaming_initialized_ = false;
+}
+
+int32_t AudioTokenizerDecoder::sample_count_for_frames(int32_t n_frames) const {
+    if (n_frames <= 0) {
+        return 0;
+    }
+    if (sample_stride_ <= 0) {
+        return 0;
+    }
+    return std::max<int32_t>(0, sample_stride_ * n_frames + sample_offset_);
+}
+
+bool AudioTokenizerDecoder::analyze_output_geometry() {
+    std::vector<int32_t> zero_codes((size_t)2 * model_.config.n_codebooks, 0);
+    std::vector<float> samples_1;
+    std::vector<float> samples_2;
+
+    if (!decode(zero_codes.data(), 1, samples_1)) {
+        error_msg_ = "Failed to analyze decoder output geometry (1 frame): " + error_msg_;
+        return false;
+    }
+    if (!decode(zero_codes.data(), 2, samples_2)) {
+        error_msg_ = "Failed to analyze decoder output geometry (2 frames): " + error_msg_;
+        return false;
+    }
+
+    sample_stride_ = (int32_t)samples_2.size() - (int32_t)samples_1.size();
+    sample_offset_ = (int32_t)samples_1.size() - sample_stride_;
+
+    if (sample_stride_ <= 0) {
+        error_msg_ = "Decoder output geometry analysis produced invalid stride";
+        return false;
+    }
+
+    return true;
 }
 
 void AudioTokenizerDecoder::normalize_codebooks() {
@@ -315,30 +357,63 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
+    // Load all decoder tensors on GPU (Vulkan/iGPU)
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_,
                                      GGML_BACKEND_DEVICE_TYPE_IGPU)) {
         return false;
     }
-    
+
     for (int i = 0; i < 4; ++i) {
         model_.dec_blocks[i].res[0].dilation = 1;
         model_.dec_blocks[i].res[1].dilation = 3;
         model_.dec_blocks[i].res[2].dilation = 9;
     }
-    
-    normalize_codebooks();
-    // Codebooks are normalized in host memory; sync once to backend tensors.
-    auto upload_if_present = [](struct ggml_tensor * t) {
-        if (t && t->data) {
-            ggml_backend_tensor_set(t, t->data, 0, ggml_nbytes(t));
+
+    // Normalize codebooks: copy to host, normalize, upload back to GPU
+    // Cannot modify Vulkan-mapped tensor->data directly
+    {
+        auto normalize_and_upload = [](struct ggml_tensor * codebook, struct ggml_tensor * usage) {
+            if (!codebook || !usage) return;
+            size_t cb_bytes = ggml_nbytes(codebook);
+            size_t usage_bytes = ggml_nbytes(usage);
+
+            // Allocate host buffers
+            std::vector<uint8_t> cb_host(cb_bytes);
+            std::vector<uint8_t> usage_host(usage_bytes);
+
+            // Download from GPU to host
+            ggml_backend_tensor_get(codebook, cb_host.data(), 0, cb_bytes);
+            ggml_backend_tensor_get(usage, usage_host.data(), 0, usage_bytes);
+
+            // Normalize on host
+            ggml_fp16_t * cb_data = (ggml_fp16_t *)cb_host.data();
+            float * usage_data = (float *)usage_host.data();
+            int64_t codebook_dim = codebook->ne[0];
+            int64_t codebook_size = codebook->ne[1];
+            const float epsilon = 1e-5f;
+
+            for (int64_t emb_idx = 0; emb_idx < codebook_size; ++emb_idx) {
+                float u = usage_data[emb_idx];
+                if (u < epsilon) u = epsilon;
+                float inv_u = 1.0f / u;
+                for (int64_t dim_idx = 0; dim_idx < codebook_dim; ++dim_idx) {
+                    int64_t idx = dim_idx + emb_idx * codebook_dim;
+                    float val = ggml_fp16_to_fp32(cb_data[idx]);
+                    cb_data[idx] = ggml_fp32_to_fp16(val * inv_u);
+                }
+            }
+
+            // Upload normalized data back to GPU
+            ggml_backend_tensor_set(codebook, cb_host.data(), 0, cb_bytes);
+        };
+
+        normalize_and_upload(model_.vq_first_codebook, model_.vq_first_usage);
+        for (int i = 0; i < 15; ++i) {
+            normalize_and_upload(model_.vq_rest_codebook[i], model_.vq_rest_usage[i]);
         }
-    };
-    upload_if_present(model_.vq_first_codebook);
-    for (int i = 0; i < 15; ++i) {
-        upload_if_present(model_.vq_rest_codebook[i]);
     }
-    
+
     state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
     if (!state_.backend) {
         return false;
@@ -368,6 +443,10 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     }
     
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
+
+    if (!analyze_output_geometry()) {
+        return false;
+    }
     
     return true;
 }
@@ -801,31 +880,31 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
     return gf;
 }
 
-bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
-                                    std::vector<float> & samples) {
-    if (!model_.ctx) {
-        error_msg_ = "Model not loaded";
+bool AudioTokenizerDecoder::decode_graph(struct ggml_cgraph * gf,
+                                         const int32_t * codes,
+                                         int32_t n_frames,
+                                         std::vector<float> & samples) {
+    if (!gf) {
+        error_msg_ = "Missing decoder graph";
         return false;
     }
-    
+
     const auto & cfg = model_.config;
-    
+
     codes_buf_.resize(n_frames * cfg.n_codebooks);
     for (int f = 0; f < n_frames; ++f) {
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
             codes_buf_[cb + f * cfg.n_codebooks] = codes[f * cfg.n_codebooks + cb];
         }
     }
-    
-    struct ggml_cgraph * gf = build_graph(n_frames);
-    
+
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
         return false;
     }
-    
+
     std::vector<int32_t> cb_codes(n_frames);
-    for (int cb = 0; cb < 16; ++cb) {
+    for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
         char name[32];
         snprintf(name, sizeof(name), "codes_cb%d", cb);
         struct ggml_tensor * cb_tensor = ggml_graph_get_tensor(gf, name);
@@ -834,48 +913,99 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
             ggml_backend_sched_reset(state_.sched);
             return false;
         }
-        
+
         for (int f = 0; f < n_frames; ++f) {
             cb_codes[f] = codes_buf_[f * cfg.n_codebooks + cb];
         }
-        
+
         ggml_backend_tensor_set(cb_tensor, cb_codes.data(), 0, n_frames * sizeof(int32_t));
     }
-    
 
-    
     struct ggml_tensor * positions_tensor = ggml_graph_get_tensor(gf, "positions");
     if (positions_tensor) {
         std::vector<int32_t> positions(n_frames);
         for (int i = 0; i < n_frames; ++i) {
             positions[i] = i;
         }
-        ggml_backend_tensor_set(positions_tensor, positions.data(), 0, 
+        ggml_backend_tensor_set(positions_tensor, positions.data(), 0,
                                 n_frames * sizeof(int32_t));
     }
-    
 
-    
     if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
         error_msg_ = "Failed to find audio tensor";
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
     int64_t n_samples = audio_tensor->ne[0];
     samples.resize(n_samples);
     ggml_backend_tensor_get(audio_tensor, samples.data(), 0, n_samples * sizeof(float));
-    
+
     ggml_backend_sched_reset(state_.sched);
-    
     return true;
+}
+
+bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
+                                    std::vector<float> & samples) {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    
+    struct ggml_cgraph * gf = build_graph(n_frames);
+
+    return decode_graph(gf, codes, n_frames, samples);
+}
+
+bool AudioTokenizerDecoder::init_streaming(int32_t chunk_frames) {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (chunk_frames <= 0) {
+        error_msg_ = "Invalid streaming chunk size";
+        return false;
+    }
+
+    if (streaming_initialized_ && streaming_graph_ && streaming_chunk_frames_ == chunk_frames) {
+        return true;
+    }
+
+    finish_streaming();
+
+    streaming_graph_ = build_graph(chunk_frames);
+    if (!streaming_graph_) {
+        error_msg_ = "Failed to build streaming decoder graph";
+        return false;
+    }
+
+    streaming_chunk_frames_ = chunk_frames;
+    streaming_initialized_ = true;
+    return true;
+}
+
+bool AudioTokenizerDecoder::decode_chunk(const int32_t * codes,
+                                         int32_t n_frames,
+                                         std::vector<float> & samples) {
+    if (!streaming_initialized_ || !streaming_graph_) {
+        error_msg_ = "Streaming decoder not initialized";
+        return false;
+    }
+
+    if (n_frames == streaming_chunk_frames_) {
+        return decode_graph(streaming_graph_, codes, n_frames, samples);
+    }
+
+    const bool ok = decode(codes, n_frames, samples);
+    finish_streaming();
+    return ok;
 }
 
 void free_audio_decoder_model(audio_decoder_model & model) {

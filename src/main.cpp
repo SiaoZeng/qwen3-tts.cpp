@@ -12,6 +12,8 @@ void print_usage(const char * program) {
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
+    fprintf(stderr, "  -e, --embedding <file> Pre-computed speaker embedding (.bin)\n");
+    fprintf(stderr, "  --save-embedding <file> Extract embedding from -r and save to .bin\n");
     fprintf(stderr, "  --temperature <val>    Sampling temperature (default: 0.9, 0=greedy)\n");
     fprintf(stderr, "  --top-k <n>            Top-k sampling (default: 50, 0=disabled)\n");
     fprintf(stderr, "  --top-p <val>          Top-p sampling (default: 1.0)\n");
@@ -31,7 +33,9 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
-    
+    std::string embedding_file;
+    std::string save_embedding_file;
+
     qwen3_tts::tts_params params;
     
     // Parse arguments
@@ -65,6 +69,18 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             reference_audio = argv[i];
+        } else if (arg == "-e" || arg == "--embedding") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing embedding file\n");
+                return 1;
+            }
+            embedding_file = argv[i];
+        } else if (arg == "--save-embedding") {
+            if (++i >= argc) {
+                fprintf(stderr, "Error: missing save-embedding file\n");
+                return 1;
+            }
+            save_embedding_file = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing temperature value\n");
@@ -155,10 +171,54 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\rGenerating: %d/%d tokens", tokens, max_tokens);
     });
     
+    // Handle embedding extraction/caching
+    if (!save_embedding_file.empty() && !reference_audio.empty()) {
+        fprintf(stderr, "Extracting speaker embedding from: %s\n", reference_audio.c_str());
+        // Load WAV file
+        std::vector<float> ref_audio;
+        int32_t ref_sr;
+        if (!qwen3_tts::load_audio_file(reference_audio, ref_audio, ref_sr)) {
+            fprintf(stderr, "Error: failed to load reference audio\n");
+            return 1;
+        }
+        std::vector<float> emb;
+        if (!tts.extract_speaker_embedding(ref_audio.data(), ref_audio.size(), emb)) {
+            fprintf(stderr, "Error: failed to extract embedding: %s\n", tts.get_error().c_str());
+            return 1;
+        }
+        int32_t emb_size = emb.size();
+        FILE * f = fopen(save_embedding_file.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "Error: failed to open %s for writing\n", save_embedding_file.c_str());
+            return 1;
+        }
+        fwrite(&emb_size, sizeof(int32_t), 1, f);
+        fwrite(emb.data(), sizeof(float), emb_size, f);
+        fclose(f);
+        fprintf(stderr, "Embedding saved: %s (%d floats, %zu bytes)\n",
+                save_embedding_file.c_str(), emb_size, sizeof(int32_t) + emb_size * sizeof(float));
+        if (text.empty()) return 0;  // extract-only mode
+    }
+
     // Generate speech
     qwen3_tts::tts_result result;
-    
-    if (reference_audio.empty()) {
+
+    if (!embedding_file.empty()) {
+        // Load pre-computed embedding (skip speaker encode)
+        FILE * f = fopen(embedding_file.c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "Error: failed to open embedding %s\n", embedding_file.c_str());
+            return 1;
+        }
+        int32_t emb_size;
+        fread(&emb_size, sizeof(int32_t), 1, f);
+        std::vector<float> emb(emb_size);
+        fread(emb.data(), sizeof(float), emb_size, f);
+        fclose(f);
+        fprintf(stderr, "Loaded embedding: %d floats from %s\n", emb_size, embedding_file.c_str());
+        fprintf(stderr, "Synthesizing with cached embedding: \"%s\"\n", text.c_str());
+        result = tts.synthesize_with_embedding(text, emb.data(), emb_size, params);
+    } else if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
         result = tts.synthesize(text, params);
     } else {

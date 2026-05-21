@@ -2,6 +2,7 @@
 #include "gguf_loader.h"
 
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -2581,6 +2582,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                float repetition_penalty,
                                float temperature,
                                int32_t top_k) {
+    const bool trace_stream_timing = getenv("QWEN3_TTS_TRACE_STREAM_TIMING") != nullptr;
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2662,6 +2664,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> embd_row(cfg.hidden_size);
     
     for (int frame = 0; frame < max_len; ++frame) {
+        auto frame_start = std::chrono::steady_clock::now();
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
             if (i != cfg.codec_eos_id) {
@@ -2728,6 +2731,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         frame_codes[0] = next_token;
         generated_cb0_tokens.insert(next_token);
         
+        auto code_pred_start = std::chrono::steady_clock::now();
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
@@ -2735,6 +2739,7 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k)) {
             return false;
         }
+        auto code_pred_end = std::chrono::steady_clock::now();
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_code_pred_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2747,6 +2752,15 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
             output.push_back(frame_codes[cb]);
         }
+
+        // Streaming callback (if set)
+        auto callback_start = std::chrono::steady_clock::now();
+        if (frame_callback_) {
+            if (!frame_callback_(frame_codes.data(), cfg.n_codebooks, frame)) {
+                break;  // callback requested stop
+            }
+        }
+        auto callback_end = std::chrono::steady_clock::now();
 
 #ifdef QWEN3_TTS_TIMING
         timing.n_frames = frame + 1;
@@ -2792,13 +2806,29 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
+        auto talker_step_start = std::chrono::steady_clock::now();
         if (!forward_step(step_embd.data(), n_past, logits)) {
             return false;
         }
+        auto talker_step_end = std::chrono::steady_clock::now();
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_talker_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
+
+        if (trace_stream_timing) {
+            const double frame_ms = std::chrono::duration<double, std::milli>(talker_step_end - frame_start).count();
+            const double code_pred_ms = std::chrono::duration<double, std::milli>(code_pred_end - code_pred_start).count();
+            const double callback_ms = std::chrono::duration<double, std::milli>(callback_end - callback_start).count();
+            const double talker_step_ms = std::chrono::duration<double, std::milli>(talker_step_end - talker_step_start).count();
+            fprintf(stderr,
+                    "[TTS/generate-frame] idx=%d frame_ms=%.2f code_pred_ms=%.2f callback_ms=%.2f talker_step_ms=%.2f\n",
+                    frame,
+                    frame_ms,
+                    code_pred_ms,
+                    callback_ms,
+                    talker_step_ms);
+        }
         
         n_past++;
     }
@@ -2848,6 +2878,19 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
 
     return true;
+}
+
+bool TTSTransformer::generate_streaming(const int32_t * text_tokens, int32_t n_tokens,
+                                         const float * speaker_embd, int32_t max_len,
+                                         frame_callback_t on_frame,
+                                         int32_t language_id, float repetition_penalty,
+                                         float temperature, int32_t top_k) {
+    frame_callback_ = std::move(on_frame);
+    std::vector<int32_t> output;
+    bool result = generate(text_tokens, n_tokens, speaker_embd, max_len, output,
+                           language_id, repetition_penalty, temperature, top_k);
+    frame_callback_ = nullptr;
+    return result;
 }
 
 bool TTSTransformer::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
